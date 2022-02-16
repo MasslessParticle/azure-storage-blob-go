@@ -21,6 +21,7 @@ type fakeBlockWriter struct {
 	path       string
 	block      int32
 	errOnBlock int32
+	stageDelay time.Duration
 }
 
 func newFakeBlockWriter() *fakeBlockWriter {
@@ -39,7 +40,12 @@ func newFakeBlockWriter() *fakeBlockWriter {
 
 func (f *fakeBlockWriter) StageBlock(ctx context.Context, blockID string, r io.ReadSeeker, cond LeaseAccessConditions, md5 []byte, cpk ClientProvidedKeyOptions) (*BlockBlobStageBlockResponse, error) {
 	n := atomic.AddInt32(&f.block, 1)
-	if n == f.errOnBlock {
+
+	if f.stageDelay > 0 {
+		time.Sleep(f.stageDelay)
+	}
+
+	if f.errOnBlock > -1 && n >= f.errOnBlock {
 		return nil, io.ErrNoProgress
 	}
 
@@ -160,6 +166,46 @@ func TestGetErr(t *testing.T) {
 		if test.want != got {
 			t.Errorf("TestGetErr(%s): got %v, want %v", test.desc, got, test.want)
 		}
+	}
+}
+
+// nolint
+func TestSlowDestCopyFrom(t *testing.T) {
+	p, err := createSrcFile(_1MiB + 500*1024) //This should cause 2 reads
+	if err != nil {
+		panic(err)
+	}
+	defer func(name string) {
+		_ = os.Remove(name)
+	}(p)
+
+	from, err := os.Open(p)
+	if err != nil {
+		panic(err)
+	}
+	defer from.Close()
+
+	br := newFakeBlockWriter()
+	defer br.cleanup()
+
+	br.stageDelay = 200 * time.Millisecond
+	br.errOnBlock = 0
+
+	errs := make(chan error, 1)
+	go func() {
+		_, err := copyFromReader(context.Background(), from, br, UploadStreamToBlockBlobOptions{})
+		errs <- err
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	select {
+	case <-ctx.Done():
+		failMsg := "TestSlowDestCopyFrom(slow writes shouldn't cause deadlock) failed: Context expired, copy deadlocked"
+		t.Error(failMsg)
+	case <-errs:
+		return
 	}
 }
 
